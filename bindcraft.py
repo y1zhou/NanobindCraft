@@ -11,9 +11,9 @@ import numpy as np
 import pandas as pd
 import pyrosetta as pr
 from Bio import BiopythonWarning
+
 from functions.biopython_utils import target_pdb_rmsd, validate_design_sequence
 from functions.colabdesign_utils import (
-    binder_hallucination,
     calc_ss_percentage,
     calculate_clash_score,
     clear_mem,
@@ -21,6 +21,7 @@ from functions.colabdesign_utils import (
     masked_binder_predict,
     mk_afdesign_model,
     mpnn_gen_sequence,
+    nanobody_hallucination,
     pr_relax,
     predict_binder_alone,
 )
@@ -676,7 +677,7 @@ def init_design_trajectory(
     print("Starting trajectory: " + design_name)
 
     ### Begin binder hallucination
-    trajectory = binder_hallucination(
+    trajectory = nanobody_hallucination(
         design_name,
         target_settings["starting_pdb"],
         target_settings["chains"],

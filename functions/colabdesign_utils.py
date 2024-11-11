@@ -23,6 +23,382 @@ from .biopython_utils import calc_ss_percentage, calculate_clash_score, hotspot_
 from .generic_utils import update_failures
 from .pyrosetta_utils import align_pdbs, pr_relax
 
+# def nanobody_pre_callback(inputs, aux, opt, key):
+#     inputs["aatype"] = inputs["aatype"].at[:].set(0)
+#     aux["pre"] = opt["pre"] + jax.random.randint(key, [], 0, 10)
+
+
+# def nanobody_post_callback(outputs, aux):
+#     aux["post"] = outputs["structure_module"]
+
+
+# def nanobody_loss_callback(outputs, params):
+#     loss = jnp.square(
+#         outputs["structure_module"]["final_atom14_positions"] + params["custom_param"]
+#     ).mean()
+#     return {"custom_loss": loss}
+
+
+def nanobody_post_design_callback(af_model: mk_afdesign_model):
+    print(af_model.get_seq(get_best=False)[0])
+
+
+def initialize_nanobody_seq(
+    af_model,
+    v_gene: str = "QVQLVESGGGLVQPGGSLRLSCAASGGSEYSYSTFSLGWFRQAPGQGLEAVAAIASMGGLTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAA",
+    j_gene: str = "WGQGTLVTVSS",
+):
+    # TODO: @y1zhou sample other alpaca germlines
+    # https://www.biorxiv.org/content/10.1101/2024.03.14.585103v1
+    # Sequence source: 10.1074/jbc.M806889200, h-NbBcII10_FGLA
+    # QVQLVESGGGLVQPGGSLRLSCAASGGSEYSYSTFSLGWFRQAPGQGLEAVAAIASMGGLTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAAVRGYFMRLPSSHNFRYWGQGTLVTVSS
+    hcdr3_len = af_model._binder_len - len(v_gene) - len(j_gene)
+    if hcdr3_len <= 0:
+        raise ValueError(
+            "The sum of the V gene, J gene, and HCDR3 length exceeds the binder length."
+        )
+
+    init_binder_aatype = np.concatenate(
+        (
+            # V gene tokens
+            np.array([residue_constants.restype_order[resname] for resname in v_gene]),
+            # Filler for the HCDR3
+            np.zeros(hcdr3_len, dtype=int),
+            # J gene tokens
+            np.array([residue_constants.restype_order[resname] for resname in j_gene]),
+        ),
+        axis=0,
+    )
+    return np.concatenate(
+        (af_model._pdb["batch"]["aatype"][: af_model._target_len], init_binder_aatype),
+        axis=0,
+    )
+
+
+def set_nanobody_seq_bias(af_model: mk_afdesign_model, rm_aa: str | None = None):
+    nb_germline = af_model._pdb["batch"]["aatype"][af_model._target_len :]
+
+    # Initialize bias with huge positive values for framework regions
+    aligner = SingleChainAnnotator(chains=["H"], scheme="martin")
+    germline_seq = "".join([residue_constants.restypes[i] for i in nb_germline])
+    region_labels: list[str] = aligner.assign_cdr_labels(
+        aligner.analyze_seq(germline_seq)
+    )
+
+    # TODO: @y1zhou instead of zeros, use pLM scores
+    framework_bias = np.zeros((af_model._binder_len, 20), dtype=float)
+
+    # Disable certain amino acids
+    if rm_aa:
+        for aa in rm_aa.split(","):
+            framework_bias[:, residue_constants.restype_order[aa]] -= 1e6
+
+    for i, label in enumerate(region_labels):
+        # CDR positions have zero bias
+        if label.startswith("cdr"):
+            continue
+        framework_bias[i, residue_constants.restype_order[germline_seq[i]]] += 1e7
+
+    af_model.set_seq(seq=nb_germline, mode=None, bias=framework_bias)
+
+
+# hallucinate a nanobody
+def nanobody_hallucination(
+    design_name,
+    starting_pdb,
+    chain,
+    target_hotspot_residues,
+    length,
+    seed,
+    helicity_value,
+    design_models,
+    advanced_settings,
+    design_paths,
+    failure_csv,
+):
+    model_pdb_path = os.path.join(design_paths["Trajectory"], design_name + ".pdb")
+
+    # clear GPU memory for new trajectory
+    clear_mem()
+
+    # initialise nanobody hallucination model
+    af_model = mk_afdesign_model(
+        protocol="binder",
+        debug=False,
+        data_dir=advanced_settings["af_params_dir"],
+        use_multimer=advanced_settings["use_multimer_design"],
+        num_recycles=advanced_settings["num_recycles_design"],
+        best_metric="loss",
+        # pre_callback=nanobody_pre_callback,
+        # post_callback=nanobody_post_callback,
+        # loss_callback=nanobody_loss_callback,
+        post_design_callback=nanobody_post_design_callback,
+    )
+
+    # sanity check for hotspots
+    if target_hotspot_residues == "":
+        target_hotspot_residues = None
+
+    af_model.prep_inputs(
+        pdb_filename=starting_pdb,
+        chain=chain,
+        binder_len=length,
+        hotspot=target_hotspot_residues,
+        seed=seed,
+        rm_aa=advanced_settings["omit_AAs"],
+        rm_target_seq=advanced_settings["rm_template_seq_design"],
+        rm_target_sc=advanced_settings["rm_template_sc_design"],
+    )
+
+    # Initialize sequence with a germline
+    af_model._pdb["batch"]["aatype"] = initialize_nanobody_seq(af_model)
+    set_nanobody_seq_bias(af_model, advanced_settings["omit_AAs"])
+
+    ### Update weights based on specified settings
+    af_model.opt["weights"].update(
+        {
+            "pae": advanced_settings["weights_pae_intra"],
+            "plddt": advanced_settings["weights_plddt"],
+            "i_pae": advanced_settings["weights_pae_inter"],
+            "con": advanced_settings["weights_con_intra"],
+            "i_con": advanced_settings["weights_con_inter"],
+        }
+    )
+
+    # redefine intramolecular contacts (con) and intermolecular contacts (i_con) definitions
+    af_model.opt["con"].update(
+        {
+            "num": advanced_settings["intra_contact_number"],
+            "cutoff": advanced_settings["intra_contact_distance"],
+            "binary": False,
+            "seqsep": 9,
+        }
+    )
+    af_model.opt["i_con"].update(
+        {
+            "num": advanced_settings["inter_contact_number"],
+            "cutoff": advanced_settings["inter_contact_distance"],
+            "binary": False,
+        }
+    )
+
+    ### additional loss functions
+    if advanced_settings["use_rg_loss"]:
+        # radius of gyration loss
+        add_rg_loss(af_model, advanced_settings["weights_rg"])
+
+    if advanced_settings["use_i_ptm_loss"]:
+        # interface pTM loss
+        add_i_ptm_loss(af_model, advanced_settings["weights_iptm"])
+
+    if advanced_settings["use_termini_distance_loss"]:
+        # termini distance loss
+        add_termini_distance_loss(af_model, advanced_settings["weights_termini_loss"])
+
+    # add the helicity loss
+    add_helix_loss(af_model, helicity_value)
+
+    # calculate the number of mutations to do based on the length of the protein
+    greedy_tries = math.ceil(length * (advanced_settings["greedy_percentage"] / 100))
+
+    # initial logits to prescreen trajectory
+    print("Stage 1: Test Logits")
+    af_model.design_logits(
+        iters=50,
+        e_soft=0.9,
+        models=design_models,
+        num_models=1,
+        sample_models=advanced_settings["sample_models"],
+        save_best=True,
+    )
+
+    # determine pLDDT of best iteration according to lowest 'loss' value
+    initial_plddt = get_best_plddt(af_model, length)
+
+    # if best iteration has high enough confidence then continue
+    if initial_plddt > 0.65:
+        print("Initial trajectory pLDDT good, continuing: " + str(initial_plddt))
+        if advanced_settings["optimise_beta"]:
+            # temporarily dump model to assess secondary structure
+            af_model.save_pdb(model_pdb_path)
+            _, beta, *_ = calc_ss_percentage(model_pdb_path, advanced_settings, "B")
+            os.remove(model_pdb_path)
+
+            # if beta sheeted trajectory is detected then choose to optimise
+            if float(beta) > 15:
+                advanced_settings["soft_iterations"] = (
+                    advanced_settings["soft_iterations"]
+                    + advanced_settings["optimise_beta_extra_soft"]
+                )
+                advanced_settings["temporary_iterations"] = (
+                    advanced_settings["temporary_iterations"]
+                    + advanced_settings["optimise_beta_extra_temp"]
+                )
+                af_model.set_opt(
+                    num_recycles=advanced_settings["optimise_beta_recycles_design"]
+                )
+                print("Beta sheeted trajectory detected, optimising settings")
+
+        # how many logit iterations left
+        logits_iter = advanced_settings["soft_iterations"] - 50
+        if logits_iter > 0:
+            print("Stage 1: Additional Logits Optimisation")
+            af_model.clear_best()
+            af_model.design_logits(
+                iters=logits_iter,
+                e_soft=1,
+                models=design_models,
+                num_models=1,
+                sample_models=advanced_settings["sample_models"],
+                ramp_recycles=False,
+                save_best=True,
+            )
+            af_model._tmp["seq_logits"] = af_model.aux["seq"]["logits"]
+            logit_plddt = get_best_plddt(af_model, length)
+            print("Optimised logit trajectory pLDDT: " + str(logit_plddt))
+        else:
+            logit_plddt = initial_plddt
+
+        # perform softmax trajectory design
+        if advanced_settings["temporary_iterations"] > 0:
+            print("Stage 2: Softmax Optimisation")
+            af_model.clear_best()
+            af_model.design_soft(
+                advanced_settings["temporary_iterations"],
+                e_temp=1e-2,
+                models=design_models,
+                num_models=1,
+                sample_models=advanced_settings["sample_models"],
+                ramp_recycles=False,
+                save_best=True,
+            )
+            softmax_plddt = get_best_plddt(af_model, length)
+        else:
+            softmax_plddt = logit_plddt
+
+        # perform one hot encoding
+        if softmax_plddt > 0.65:
+            print("Softmax trajectory pLDDT good, continuing: " + str(softmax_plddt))
+            if advanced_settings["hard_iterations"] > 0:
+                af_model.clear_best()
+                print("Stage 3: One-hot Optimisation")
+                af_model.design_hard(
+                    advanced_settings["hard_iterations"],
+                    temp=1e-2,
+                    models=design_models,
+                    num_models=1,
+                    sample_models=advanced_settings["sample_models"],
+                    dropout=False,
+                    ramp_recycles=False,
+                    save_best=True,
+                )
+                onehot_plddt = get_best_plddt(af_model, length)
+
+            if onehot_plddt > 0.65:
+                # perform greedy mutation optimisation
+                print("One-hot trajectory pLDDT good, continuing: " + str(onehot_plddt))
+                if advanced_settings["greedy_iterations"] > 0:
+                    print("Stage 4: PSSM Semigreedy Optimisation")
+                    af_model.clear_best()
+                    af_model.design_pssm_semigreedy(
+                        soft_iters=0,
+                        hard_iters=advanced_settings["greedy_iterations"],
+                        tries=greedy_tries,
+                        models=design_models,
+                        num_models=1,
+                        sample_models=advanced_settings["sample_models"],
+                        ramp_models=False,
+                        save_best=True,
+                    )
+
+            else:
+                update_failures(failure_csv, "Trajectory_one-hot_pLDDT")
+                print(
+                    "One-hot trajectory pLDDT too low to continue: " + str(onehot_plddt)
+                )
+
+        else:
+            update_failures(failure_csv, "Trajectory_softmax_pLDDT")
+            print("Softmax trajectory pLDDT too low to continue: " + str(softmax_plddt))
+
+    else:
+        update_failures(failure_csv, "Trajectory_logits_pLDDT")
+        print("Initial trajectory pLDDT too low to continue: " + str(initial_plddt))
+
+    ### save trajectory PDB
+    final_plddt = get_best_plddt(af_model, length)
+    af_model.save_pdb(model_pdb_path)
+    af_model.aux["log"]["terminate"] = ""
+
+    # let's check whether the trajectory is worth optimising by checking confidence, clashes, and contacts
+    # check clashes
+    # clash_interface = calculate_clash_score(model_pdb_path, 2.4)
+    ca_clashes = calculate_clash_score(model_pdb_path, 2.5, only_ca=True)
+
+    # if clash_interface > 25 or ca_clashes > 0:
+    if ca_clashes > 0:
+        af_model.aux["log"]["terminate"] = "Clashing"
+        update_failures(failure_csv, "Trajectory_Clashes")
+        print("Severe clashes detected, skipping analysis and MPNN optimisation")
+        print("")
+    else:
+        # check if low quality prediction
+        if final_plddt < 0.7:
+            af_model.aux["log"]["terminate"] = "LowConfidence"
+            update_failures(failure_csv, "Trajectory_final_pLDDT")
+            print(
+                "Trajectory starting confidence low, skipping analysis and MPNN optimisation"
+            )
+            print("")
+        else:
+            # does it have enough contacts to consider?
+            binder_contacts = hotspot_residues(model_pdb_path)
+            binder_contacts_n = len(binder_contacts.items())
+
+            # if less than 3 contacts then protein is floating above and is not binder
+            if binder_contacts_n < 3:
+                af_model.aux["log"]["terminate"] = "LowConfidence"
+                update_failures(failure_csv, "Trajectory_Contacts")
+                print(
+                    "Too few contacts at the interface, skipping analysis and MPNN optimisation"
+                )
+                print("")
+            else:
+                # phew, trajectory is okay! We can continue
+                af_model.aux["log"]["terminate"] = ""
+                print("Trajectory successful, final pLDDT: " + str(final_plddt))
+
+    # move low quality prediction:
+    if af_model.aux["log"]["terminate"] != "":
+        shutil.move(
+            model_pdb_path,
+            design_paths[f"Trajectory/{af_model.aux['log']['terminate']}"],
+        )
+
+    ### get the sampled sequence for plotting
+    af_model.get_seqs()
+    if advanced_settings["save_design_trajectory_plots"]:
+        plot_trajectory(af_model, design_name, design_paths)
+
+    ### save the hallucination trajectory animation
+    if advanced_settings["save_design_animations"]:
+        plots = af_model.animate(dpi=150)
+        with open(
+            os.path.join(design_paths["Trajectory/Animation"], design_name + ".html"),
+            "w",
+        ) as f:
+            f.write(plots)
+        plt.close("all")
+
+    if advanced_settings["save_trajectory_pickle"]:
+        with open(
+            os.path.join(design_paths["Trajectory/Pickle"], design_name + ".pickle"),
+            "wb",
+        ) as handle:
+            pickle.dump(af_model.aux["all"], handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return af_model
+
 
 # hallucinate a binder
 def binder_hallucination(
