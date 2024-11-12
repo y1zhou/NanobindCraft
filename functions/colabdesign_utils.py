@@ -15,7 +15,14 @@ import numpy as np
 from antpack import SingleChainAnnotator
 from colabdesign import clear_mem, mk_afdesign_model
 from colabdesign.af.alphafold.common import residue_constants
-from colabdesign.af.loss import _get_con_loss, get_dgram_bins, get_ptm, mask_loss
+from colabdesign.af.loss import (
+    _get_con_loss,
+    get_con_loss,
+    get_dgram_bins,
+    get_plddt_loss,
+    get_ptm,
+    mask_loss,
+)
 from colabdesign.mpnn import mk_mpnn_model
 from colabdesign.shared.utils import copy_dict
 
@@ -30,6 +37,42 @@ from .pyrosetta_utils import align_pdbs, pr_relax
 
 # def nanobody_post_callback(outputs, aux):
 #     aux["post"] = outputs["structure_module"]
+
+
+def add_cdr_plddt_loss(af_model: mk_afdesign_model, weight=1.0):
+    def loss_cdr_plddt(inputs, outputs):
+        cdr_plddt = get_plddt_loss(
+            outputs,
+            jnp.concat(
+                (jnp.zeros(af_model._target_len), af_model._inputs["cdr_mask"]), axis=0
+            ),
+        )
+        return {"cdr_plddt": cdr_plddt}
+
+    af_model._callbacks["model"]["loss"].append(loss_cdr_plddt)
+    af_model.opt["weights"]["cdr_plddt"] = weight
+
+
+def modify_cdr_i_con_loss(af_model: mk_afdesign_model, weight: float):
+    """See `_af_loss._loss_binder` for ref."""
+    opt = af_model.opt
+    tL, bL = af_model._target_len, af_model._binder_len
+    mask = jnp.concat((jnp.ones(tL), af_model._inputs["cdr_mask"]), axis=0)
+    zeros = jnp.zeros_like(mask)
+    binder_id = zeros.at[-bL:].set(mask[-bL:])
+    if "hotspot" in opt:
+        target_id = zeros.at[opt["hotspot"]].set(mask[opt["hotspot"]])
+    else:
+        target_id = zeros.at[:tL].set(mask[:tL])
+
+    def loss_cdr_con(inputs, outputs):
+        cdr_con = get_con_loss(
+            inputs, outputs, opt["i_con"], mask_1d=target_id, mask_1b=binder_id
+        )
+        return {"cdr_i_con": cdr_con}
+
+    af_model._callbacks["model"]["loss"].append(loss_cdr_con)
+    af_model.opt["weights"]["cdr_i_con"] = weight
 
 
 # def nanobody_loss_callback(outputs, params):
@@ -68,7 +111,8 @@ def initialize_nanobody_seq(
             # V gene tokens
             np.array([residue_constants.restype_order[resname] for resname in v_gene]),
             # Filler for the HCDR3
-            np.zeros(hcdr3_len, dtype=int),
+            # TODO: @y1zhou initialize with a more realistic HCDR3 sequence
+            residue_constants.restype_order["G"] * np.ones(hcdr3_len, dtype=int),
             # J gene tokens
             np.array([residue_constants.restype_order[resname] for resname in j_gene]),
         ),
@@ -169,7 +213,7 @@ def nanobody_hallucination(
             "plddt": advanced_settings["weights_plddt"],
             "i_pae": advanced_settings["weights_pae_inter"],
             "con": advanced_settings["weights_con_intra"],
-            "i_con": advanced_settings["weights_con_inter"],
+            "i_con": 0,  # use cdr_con instead of con
         }
     )
 
@@ -206,13 +250,20 @@ def nanobody_hallucination(
     # add the helicity loss
     add_helix_loss(af_model, helicity_value)
 
+    # Add CDR pLDDT loss
+    add_cdr_plddt_loss(af_model, advanced_settings["weights_cdr_plddt"])
+
+    # Modify inter-chain contact losses to only consider CDR
+    modify_cdr_i_con_loss(af_model, advanced_settings["weights_con_inter"])
+
     # calculate the number of mutations to do based on the length of the protein
     greedy_tries = math.ceil(length * (advanced_settings["greedy_percentage"] / 100))
 
     # initial logits to prescreen trajectory
     print("Stage 1: Test Logits")
+    logit_iters = min(50, advanced_settings["soft_iterations"] * 2 // 3)
     af_model.design_logits(
-        iters=50,
+        iters=logit_iters,
         e_soft=0.9,
         models=design_models,
         num_models=1,
@@ -248,7 +299,7 @@ def nanobody_hallucination(
                 print("Beta sheeted trajectory detected, optimising settings")
 
         # how many logit iterations left
-        logits_iter = advanced_settings["soft_iterations"] - 50
+        logits_iter = advanced_settings["soft_iterations"] - logit_iters
         if logits_iter > 0:
             print("Stage 1: Additional Logits Optimisation")
             af_model.clear_best()
