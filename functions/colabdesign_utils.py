@@ -40,6 +40,11 @@ from .pyrosetta_utils import align_pdbs, pr_relax
 
 
 def nanobody_post_design_callback(af_model: mk_afdesign_model):
+    # Clear the gradients on framework positions and accelerate CDR sampling
+    af_model.aux["grad"]["seq"][:, ~af_model._inputs["cdr_mask"], :] = 0
+    af_model.aux["grad"]["seq"][:, af_model._inputs["cdr_mask"], :] *= 1.618
+
+    # Log the sampled sequence in the previous round
     print(af_model.get_seq(get_best=False)[0])
 
 
@@ -93,13 +98,16 @@ def set_nanobody_seq_bias(af_model: mk_afdesign_model, rm_aa: str | None = None)
         for aa in rm_aa.split(","):
             framework_bias[:, residue_constants.restype_order[aa]] -= 1e6
 
+    cdr_mask = np.array([False] * af_model._binder_len)
     for i, label in enumerate(region_labels):
         # CDR positions have zero bias
         if label.startswith("cdr"):
+            cdr_mask[i] = True
             continue
         framework_bias[i, residue_constants.restype_order[germline_seq[i]]] += 1e7
 
     af_model.set_seq(seq=nb_germline, mode=None, bias=framework_bias)
+    af_model._inputs["cdr_mask"] = cdr_mask
 
 
 # hallucinate a nanobody
