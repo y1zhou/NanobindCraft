@@ -75,17 +75,10 @@ def modify_cdr_i_con_loss(af_model: mk_afdesign_model, weight: float):
     af_model.opt["weights"]["cdr_i_con"] = weight
 
 
-# def nanobody_loss_callback(outputs, params):
-#     loss = jnp.square(
-#         outputs["structure_module"]["final_atom14_positions"] + params["custom_param"]
-#     ).mean()
-#     return {"custom_loss": loss}
-
-
 def nanobody_post_design_callback(af_model: mk_afdesign_model):
     # Clear the gradients on framework positions and accelerate CDR sampling
     af_model.aux["grad"]["seq"][:, ~af_model._inputs["cdr_mask"], :] = 0
-    af_model.aux["grad"]["seq"][:, af_model._inputs["cdr_mask"], :] *= 1.618
+    # af_model.aux["grad"]["seq"][:, af_model._inputs["cdr_mask"], :] *= 1.618
 
     # Log the sampled sequence in the previous round
     print(af_model.get_seq(get_best=False)[0])
@@ -195,13 +188,21 @@ def nanobody_hallucination(
 
     af_model.prep_inputs(
         pdb_filename=starting_pdb,
-        chain=chain,
+        target_chain=chain,
         binder_len=length,
         hotspot=target_hotspot_residues,
         seed=seed,
         rm_aa=advanced_settings["omit_AAs"],
         rm_target_seq=advanced_settings["rm_template_seq_design"],
         rm_target_sc=advanced_settings["rm_template_sc_design"],
+        # Binder template
+        binder_chain=advanced_settings["binder_chain"]
+        if advanced_settings["use_binder_template"]
+        else None,
+        use_binder_template=advanced_settings["use_binder_template"],
+        rm_binder_seq=advanced_settings["rm_binder_seq_design"],
+        rm_binder_sc=advanced_settings["rm_binder_sc_design"],
+        rm_template_ic=advanced_settings["rm_template_ic"],
     )
 
     # Initialize sequence with a germline
@@ -215,7 +216,8 @@ def nanobody_hallucination(
             "plddt": advanced_settings["weights_plddt"],
             "i_pae": advanced_settings["weights_pae_inter"],
             "con": advanced_settings["weights_con_intra"],
-            "i_con": 0,  # use cdr_con instead of con
+            "i_con": 0.0,  # use cdr_con instead of con
+            "dgram_cce": 0.0,
         }
     )
 
@@ -253,7 +255,7 @@ def nanobody_hallucination(
     add_helix_loss(af_model, helicity_value)
 
     # Add CDR pLDDT loss
-    add_cdr_plddt_loss(af_model, advanced_settings["weights_cdr_plddt"])
+    add_cdr_plddt_loss(af_model, 3 * advanced_settings["weights_plddt"])
 
     # Modify inter-chain contact losses to only consider CDR
     modify_cdr_i_con_loss(af_model, advanced_settings["weights_con_inter"])
@@ -263,7 +265,7 @@ def nanobody_hallucination(
 
     # initial logits to prescreen trajectory
     print("Stage 1: Test Logits")
-    logit_iters = min(50, advanced_settings["soft_iterations"] * 2 // 3)
+    logit_iters = advanced_settings["soft_iterations"] * 2 // 3
     af_model.design_logits(
         iters=logit_iters,
         e_soft=0.9,
