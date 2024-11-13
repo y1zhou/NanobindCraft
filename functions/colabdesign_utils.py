@@ -92,9 +92,10 @@ def nanobody_post_design_callback(af_model: mk_afdesign_model):
 
 
 def initialize_nanobody_seq(
-    af_model,
+    af_model: mk_afdesign_model,
     v_gene: str = "QVQLVESGGGLVQPGGSLRLSCAASGGSEYSYSTFSLGWFRQAPGQGLEAVAAIASMGGLTYYADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAA",
     j_gene: str = "WGQGTLVTVSS",
+    seed: int = 0,
 ):
     # TODO: @y1zhou sample other alpaca germlines
     # https://www.biorxiv.org/content/10.1101/2024.03.14.585103v1
@@ -106,13 +107,14 @@ def initialize_nanobody_seq(
             "The sum of the V gene, J gene, and HCDR3 length exceeds the binder length."
         )
 
+    rng = np.random.default_rng(seed)
     init_binder_aatype = np.concatenate(
         (
             # V gene tokens
             np.array([residue_constants.restype_order[resname] for resname in v_gene]),
             # Filler for the HCDR3
             # TODO: @y1zhou initialize with a more realistic HCDR3 sequence
-            residue_constants.restype_order["G"] * np.ones(hcdr3_len, dtype=int),
+            rng.integers(low=0, high=20, size=hcdr3_len),
             # J gene tokens
             np.array([residue_constants.restype_order[resname] for resname in j_gene]),
         ),
@@ -203,7 +205,7 @@ def nanobody_hallucination(
     )
 
     # Initialize sequence with a germline
-    af_model._pdb["batch"]["aatype"] = initialize_nanobody_seq(af_model)
+    af_model._pdb["batch"]["aatype"] = initialize_nanobody_seq(af_model, seed=seed)
     set_nanobody_seq_bias(af_model, advanced_settings["omit_AAs"])
 
     ### Update weights based on specified settings
